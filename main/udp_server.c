@@ -23,9 +23,9 @@
 #include "lwip/sys.h"
 #include <lwip/netdb.h>
 
-#define PORT CONFIG_EXAMPLE_PORT
+#define PORT 3060
 
-static const char *TAG = "example";
+static const char *TAG = "ESP32_UDP_SERVER";
 static void send_wakeup_magic_packet(const char *mac_str) {
     uint8_t target_mac[6];
     
@@ -84,7 +84,6 @@ static void udp_server_task(void *pvParameters)
     struct sockaddr_in6 dest_addr;
 
     while (1) {
-
         if (addr_family == AF_INET) {
             struct sockaddr_in *dest_addr_ip4 = (struct sockaddr_in *)&dest_addr;
             dest_addr_ip4->sin_addr.s_addr = htonl(INADDR_ANY);
