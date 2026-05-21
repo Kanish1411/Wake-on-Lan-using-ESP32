@@ -17,26 +17,39 @@
 #include "nvs_flash.h"
 #include "esp_netif.h"
 #include "protocol_examples_common.h"
+#include "esp_http_server.h"
+#include "esp_log.h"
 
 #include "lwip/err.h"
 #include "lwip/sockets.h"
 #include "lwip/sys.h"
 #include <lwip/netdb.h>
 
-#define PORT 3060
+static char log_buffer[10][256] = {
+    "System initialized. Awaiting incoming network commands..."
+};
+static char status_buffer[10][256] = {
+    "No commands received yet."
+};
 
-static const char *TAG = "ESP32_UDP_SERVER";
-static void send_wakeup_magic_packet(const char *mac_str) {
+
+static int current_log_idx = 1;
+
+#define PORT CONFIG_EXAMPLE_PORT
+
+static const char *TAG = "ESP_UDP_SERVER";
+static void send_wakeup_magic_packet(const char *mac_str, const char *command, const char *addr_str) {
     uint8_t target_mac[6];
-    
-    // Convert text string "aa:bb:cc:dd:ee:ff" or "aa-bb-cc-dd-ee-ff" into a raw 6-byte hex array
+    snprintf(log_buffer[current_log_idx], sizeof(log_buffer[current_log_idx]), "Command: %s, Target: %s From: %s", command, mac_str, addr_str);
+
     int parsed_fields = sscanf(mac_str, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", 
                                &target_mac[0], &target_mac[1], &target_mac[2], 
                                &target_mac[3], &target_mac[4], &target_mac[5]);
                                
-    // Security check: Ensure all 6 bytes of the MAC address were actually present and parsed
     if (parsed_fields != 6) {
         ESP_LOGE(TAG, "Invalid MAC address format layout: %s", mac_str);
+        snprintf(status_buffer[current_log_idx], sizeof(status_buffer[current_log_idx]), "%s", "<div style='color:red;'>Error: Invalid MAC address format.</div>");
+        current_log_idx = (current_log_idx + 1) % 10;
         return;
     }
 
@@ -55,6 +68,8 @@ static void send_wakeup_magic_packet(const char *mac_str) {
     int broadcast_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
     if (broadcast_sock < 0) {
         ESP_LOGE(TAG, "Failed to instantiate broadcast socket");
+        snprintf(status_buffer[current_log_idx], sizeof(status_buffer[current_log_idx]), "%s", "<div style='color:red;'>Error: Failed to create broadcast socket.</div>");
+        current_log_idx = (current_log_idx + 1) % 10;
         return;
     }
 
@@ -73,8 +88,72 @@ static void send_wakeup_magic_packet(const char *mac_str) {
            (struct sockaddr *)&broadcast_addr, sizeof(broadcast_addr));
 
     ESP_LOGI(TAG, "Magic packet successfully broadcasted to hardware targets.");
+    
+    snprintf(status_buffer[current_log_idx], sizeof(status_buffer[current_log_idx]), "%s", "<div style='color:green;'>Magic packet sent successfully.</div>");
+    current_log_idx = (current_log_idx + 1) % 10;
     close(broadcast_sock);
 }
+
+
+static esp_err_t homepage_action_handler(httpd_req_t *req)
+{
+    ESP_LOGW("ESP32_ACTION", "Web Server Triggered");
+    httpd_resp_set_type(req, "text/html");
+
+    // 1. Send the HTML header chunk
+    const char *html_head = "<!DOCTYPE html><html><head><title>ESP32 Web Server</title></head>"
+                            "<style>body{ background-color: #121212; color: #00ff66; text-align: center; }</style>"
+                            "<body><h1>ESP32 Logs</h1><br>"
+                            "<div style='background:#1a1a1e; color:#00ff66; padding:20px; border-radius:6px; "
+                            "border:1px solid #29292e; font-family:monospace; text-align:left; "
+                            "display:inline-block; width:80%%; max-width:600px; max-height:400px; overflow-y:auto; "
+                            "white-space:pre-wrap; line-height:1.6; text-align: center;'>";
+    httpd_resp_sendstr_chunk(req, html_head);
+
+    // 2. Loop through and stream your logs directly line-by-line
+    for(int i = 0; i < 10; i++) {
+        // Only print if the log row actually contains written data
+        if (strlen(log_buffer[i]) > 0) {
+            char row_buf[261];
+            char status_buf[261];
+            // Format line cleanly with an HTML line break
+            snprintf(row_buf, sizeof(row_buf), "%s", log_buffer[i]);
+            snprintf(status_buf, sizeof(status_buf), "%s<br>", status_buffer[i]);
+            // Push this line out directly to the network buffer
+            httpd_resp_sendstr_chunk(req, row_buf);
+            httpd_resp_sendstr_chunk(req, status_buf);
+        }
+    }
+
+    // 3. Send the HTML footer closing tags
+    const char *html_foot = "</div></body></html>";
+    httpd_resp_sendstr_chunk(req, html_foot);
+
+    // 4. Send an empty chunk to explicitly tell the browser we are done transmission
+    httpd_resp_sendstr_chunk(req, NULL);
+
+    return ESP_OK;
+}
+
+static const httpd_uri_t homepage_uri = {
+    .uri       = "/",
+    .method    = HTTP_GET,
+    .handler   = homepage_action_handler,
+    .user_ctx  = NULL
+};
+
+static void start_my_web_server(void)
+{
+    httpd_handle_t my_server = NULL;
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG(); // This fires up TCP Port 80
+
+    if (httpd_start(&my_server, &config) == ESP_OK) {
+        // Register your clean single-page layout
+        httpd_register_uri_handler(my_server, &homepage_uri);
+        ESP_LOGI("WEB_SERVER", "Web server successfully launched on port 80!");
+    }
+}
+
 static void udp_server_task(void *pvParameters)
 {
     char rx_buffer[128];
@@ -84,6 +163,7 @@ static void udp_server_task(void *pvParameters)
     struct sockaddr_in6 dest_addr;
 
     while (1) {
+
         if (addr_family == AF_INET) {
             struct sockaddr_in *dest_addr_ip4 = (struct sockaddr_in *)&dest_addr;
             dest_addr_ip4->sin_addr.s_addr = htonl(INADDR_ANY);
@@ -183,7 +263,7 @@ static void udp_server_task(void *pvParameters)
                 rx_buffer[len] = 0; // Null-terminate whatever we received and treat like a string...
                 char *command = strtok(rx_buffer, " ");
 
-                // 2. Validate that the command is actually "ping"
+                // 2. Validate that the command is actually "connect"
                 if (command != NULL && strncmp(command, "ping", 4) == 0) {
                     
                     // 3. Extract the second token (The Target Address)
@@ -193,12 +273,16 @@ static void udp_server_task(void *pvParameters)
                     if (target_addr != NULL) {
                         ESP_LOGI(TAG, "Command: %s", command);
                         ESP_LOGI(TAG, "Target Address Extracted: %s", target_addr);
+                        ESP_LOGI(TAG, "Address Extracted: %s", addr_str);
                         
-                        // 4. Trigger our Broadcast Action
-                        send_wakeup_magic_packet(target_addr);
+                        send_wakeup_magic_packet(target_addr, command, addr_str);
+                        
                         
                     } else {
                         ESP_LOGW(TAG, "Missing target address parameter!");
+                        snprintf(log_buffer[current_log_idx], sizeof(log_buffer[current_log_idx]), "Command: %s, Missing Target Address From: %s", command, addr_str);
+                        snprintf(status_buffer[current_log_idx], sizeof(status_buffer[current_log_idx]), "%s", "<div style='color:red;'>Error: Missing target address.</div>");
+                        current_log_idx = (current_log_idx + 1) % 10;
                     }
                 }
 
@@ -230,6 +314,7 @@ void app_main(void)
      * examples/protocols/README.md for more information about this function.
      */
     ESP_ERROR_CHECK(example_connect());
+    start_my_web_server();
 
 #ifdef CONFIG_EXAMPLE_IPV4
     xTaskCreate(udp_server_task, "udp_server", 4096, (void*)AF_INET, 5, NULL);
