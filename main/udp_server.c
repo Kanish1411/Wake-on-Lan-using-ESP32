@@ -24,11 +24,15 @@
 #include "lwip/sockets.h"
 #include "lwip/sys.h"
 #include <lwip/netdb.h>
+#include <time.h>
+#include <sys/time.h>
+#include "esp_sntp.h"
 
-static char log_buffer[10][256] = {
+
+static char log_buffer[32][256] = {
     "System initialized. Awaiting incoming network commands..."
 };
-static char status_buffer[10][256] = {
+static char status_buffer[32][256] = {
     "No commands received yet."
 };
 
@@ -43,16 +47,42 @@ static const char *TAG = "ESP_UDP_SERVER";
 typedef struct {
     char ip[48];
     char token[SESSION_TOKEN_LEN + 1];
-    int64_t expiry_time; 
+    int64_t expiry_time;
+    char location[64];
 } client_session_t;
 
 static client_session_t session_table[MAX_SESSIONS];
+static char timestamp[32];
 
 extern const unsigned char servercert_start[] asm("_binary_servercert_pem_start");
 extern const unsigned char servercert_end[]   asm("_binary_servercert_pem_end");
 extern const unsigned char prkey_start[] asm("_binary_prkey_pem_start");
 extern const unsigned char prkey_end[]   asm("_binary_prkey_pem_end");
 
+void init_sntp_time(void)
+{
+    ESP_LOGI("SNTP", "Initializing SNTP Engine...");
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "time.google.com"); // Global NTP server pool
+    esp_sntp_init();
+    setenv("TZ", "IST-5:30", 1);
+    tzset();
+        while (sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET) {
+            ESP_LOGI("SNTP", "Waiting for time synchronization...");
+            vTaskDelay(2000 / portTICK_PERIOD_MS);
+        }
+    ESP_LOGI("SNTP", "SNTP Engine initialized and time synchronized.");
+}
+
+void get_timestamp_str(char *buf, size_t max_len)
+{
+    time_t now;
+    struct tm timeinfo;
+    time(&now);
+    localtime_r(&now, &timeinfo);
+    
+    strftime(buf, max_len, "%Y-%m-%d %H:%M:%S", &timeinfo);
+}
 
 static void url_decode(char *dst, const char *src) {
     char a, b;
@@ -63,7 +93,6 @@ static void url_decode(char *dst, const char *src) {
             if (a >= 'a') a -= 'a' - 10;
             else if (a >= 'A') a -= 'A' - 10;
             else a -= '0';
-            
             if (b >= 'a') b -= 'a' - 10;
             else if (b >= 'A') b -= 'A' - 10;
             else b -= '0';
@@ -80,7 +109,6 @@ static void url_decode(char *dst, const char *src) {
     *dst = '\0';
 }
 
-// Helper function to extract IP from an active HTTP request
 static void get_client_ip(httpd_req_t *req, char *ip_str, size_t max_len) {
     strncpy(ip_str, "Unknown", max_len);
     int sockfd = httpd_req_to_sockfd(req);        
@@ -110,7 +138,9 @@ static void send_wakeup_magic_packet(const char *mac_str, const char *command, c
     char mask_mac[18];
     snprintf(mask_mac, sizeof(mask_mac), "%s", mac_str);
     snprintf(mac_unreadable, sizeof(mac_unreadable), "%.5s:xx:xx:xx:xx", mask_mac);
-    snprintf(log_buffer[current_log_idx], sizeof(log_buffer[current_log_idx]), "Command: %s, Target: %s From: %s", command, mac_unreadable, addr_str);
+    
+    get_timestamp_str(timestamp, sizeof(timestamp));
+    snprintf(log_buffer[current_log_idx], sizeof(log_buffer[current_log_idx]), "[%s] Command: %s, Target: %s From: %s", timestamp, command, mac_unreadable, addr_str);
 
     int parsed_fields = sscanf(mac_str, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", 
                                &target_mac[0], &target_mac[1], &target_mac[2], 
@@ -159,13 +189,11 @@ static bool is_logged_in(httpd_req_t *req) {
     char ip_str[48] = {0};
     get_client_ip(req, ip_str, sizeof(ip_str));
 
-    // Extract and check the Cookie header string
     char cookie_buf[128] = {0};
     size_t header_len = httpd_req_get_hdr_value_len(req, "Cookie");
 
     if (header_len > 0 && header_len < sizeof(cookie_buf)) {
         if (httpd_req_get_hdr_value_str(req, "Cookie", cookie_buf, sizeof(cookie_buf)) == ESP_OK) {
-            // Find an active session in our table matching this client's IP and cookie token
             for (int i = 0; i < MAX_SESSIONS; i++) {
                 if (strlen(session_table[i].token) > 0 && 
                     strcmp(session_table[i].ip, ip_str) == 0 && 
@@ -175,12 +203,108 @@ static bool is_logged_in(httpd_req_t *req) {
             }
         }
     }
-
-    // Fallback: Log unauthorized attempts dynamically
-    snprintf(log_buffer[current_log_idx], sizeof(log_buffer[current_log_idx]), "Unauthorized access attempt from: %s", ip_str);
+    get_timestamp_str(timestamp, sizeof(timestamp));
+    snprintf(log_buffer[current_log_idx], sizeof(log_buffer[current_log_idx]), "[%s] Unauthorized access attempt from: %s", timestamp, ip_str);
     snprintf(status_buffer[current_log_idx], sizeof(status_buffer[current_log_idx]), "%s", "<div style='color:red;'>Unauthorized access. Please log in.</div>");
     current_log_idx = (current_log_idx + 1) % 10;
     return false;
+}
+
+static esp_err_t login_page(httpd_req_t *req)
+{
+    char ip_str[48] = {0};
+    get_client_ip(req, ip_str, sizeof(ip_str));
+    
+    bool already_logged = false;
+    char cookie_buf[128] = {0};
+    size_t header_len = httpd_req_get_hdr_value_len(req, "Cookie");
+
+    if (header_len > 0 && header_len < sizeof(cookie_buf)) {
+        if (httpd_req_get_hdr_value_str(req, "Cookie", cookie_buf, sizeof(cookie_buf)) == ESP_OK) {
+            for (int i = 0; i < MAX_SESSIONS; i++) {
+                if (strlen(session_table[i].token) > 0 && 
+                    strcmp(session_table[i].ip, ip_str) == 0 && 
+                    strstr(cookie_buf, session_table[i].token) != NULL) {
+                    already_logged = true;
+                    break;
+                }
+            }
+        }
+    }
+    if (!already_logged) {
+        httpd_resp_set_type(req, "text/html");
+        httpd_resp_sendstr_chunk(req, "<!DOCTYPE html><html><head><title>Login</title></head>"
+                                    "<style>body{ background-color: #121212; color: #00ff66; text-align: center; }</style>"
+                                    "<body><h1>Login</h1><br>"
+                                    "<form method='POST' action='/login'>"
+                                    "<input type='text' name='username' placeholder='Username'><br><br>"
+                                    "<input type='password' name='password' placeholder='Password'><br><br>"
+                                    "<input type='submit' value='Login'>"
+                                    "</form></body></html>");
+        httpd_resp_sendstr_chunk(req, NULL);
+    } else {
+        httpd_resp_set_status(req, "303 See Other");
+        httpd_resp_set_hdr(req, "Location", "/");
+        httpd_resp_sendstr_chunk(req, NULL);
+    }
+    return ESP_OK;
+}
+
+static esp_err_t login_action_handler(httpd_req_t *req)
+{
+    char content[128] = {0};
+    size_t recv_size = req->content_len;
+
+    if (recv_size >= sizeof(content)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Payload too large");
+        return ESP_FAIL;
+    }
+
+    int ret = httpd_req_recv(req, content, recv_size);
+    if (ret <= 0) return ESP_FAIL;
+    content[recv_size] = '\0'; 
+
+    char username[32] = {0};
+    char password[128] = {0};
+
+    if (httpd_query_key_value(content, "username", username, sizeof(username)) == ESP_OK &&
+        httpd_query_key_value(content, "password", password, sizeof(password)) == ESP_OK) {
+
+        if (strcmp(username, "admin") == 0 && strcmp(password, "admin") == 0) {
+            
+            char ip_str[48] = {0};
+            get_client_ip(req, ip_str, sizeof(ip_str)); 
+
+            char generated_token[17] = {0};
+            snprintf(generated_token, sizeof(generated_token), "%08lx%08lx", esp_random(), esp_random());
+
+            int slot_to_use = 0; 
+            for(int i = 0; i < MAX_SESSIONS; i++) {
+                if(strlen(session_table[i].token) == 0 || strcmp(session_table[i].ip, ip_str) == 0) {
+                    slot_to_use = i;
+                    break;
+                }
+            }
+            
+            strcpy(session_table[slot_to_use].ip, ip_str);
+            strcpy(session_table[slot_to_use].token, generated_token);
+            
+
+            char cookie_header[128];
+            snprintf(cookie_header, sizeof(cookie_header), "session=%s; Path=/; HttpOnly; Secure", generated_token);
+
+            httpd_resp_set_status(req, "303 See Other");
+            httpd_resp_set_hdr(req, "Location", "/");
+            httpd_resp_set_hdr(req, "Set-Cookie", cookie_header);
+            httpd_resp_sendstr_chunk(req, NULL);
+            return ESP_OK;
+        }
+    }
+
+    httpd_resp_set_status(req, "303 See Other");
+    httpd_resp_set_hdr(req, "Location", "/login");
+    httpd_resp_sendstr_chunk(req, NULL);
+    return ESP_OK;
 }
 
 static esp_err_t homepage_action_handler(httpd_req_t *req){
@@ -190,6 +314,7 @@ static esp_err_t homepage_action_handler(httpd_req_t *req){
         httpd_resp_sendstr_chunk(req, NULL);
         return ESP_OK;
     }
+    
     httpd_resp_set_type(req, "text/html");
     httpd_resp_sendstr_chunk(req,  "<!DOCTYPE html><html><head><title>ESP32 Web Server</title></head>"
                                 "<style>body{ background-color: #121212; color: #00ff66; text-align: center; }</style>"
@@ -201,6 +326,7 @@ static esp_err_t homepage_action_handler(httpd_req_t *req){
     httpd_resp_sendstr_chunk(req, NULL);
     return ESP_OK;
 }
+
 static esp_err_t wol_handler(httpd_req_t *req){
     if (!is_logged_in(req)) {
         httpd_resp_set_status(req, "303 See Other");
@@ -247,17 +373,25 @@ static esp_err_t wol_action_handler(httpd_req_t *req){
         char decoded_mac[32] = {0};
         url_decode(decoded_mac, mac);
         get_client_ip(req, ip_str, sizeof(ip_str));
-        snprintf(log_buffer[current_log_idx], sizeof(log_buffer[current_log_idx]), "WoL command received for MAC: %s from IP: %s", decoded_mac, ip_str);
+        get_timestamp_str(timestamp, sizeof(timestamp));
+        snprintf(log_buffer[current_log_idx], sizeof(log_buffer[current_log_idx]), "[%s] WoL command received for MAC: %.5s:xx:xx:xx:xx from IP: %s", timestamp, decoded_mac, ip_str);
         snprintf(status_buffer[current_log_idx], sizeof(status_buffer[current_log_idx]), "%s", "<div style='color:green;'>WoL command received. Attempting to send magic packet...</div>");
         current_log_idx = (current_log_idx + 1) % 10;
         send_wakeup_magic_packet(decoded_mac, "Manual WoL Trigger", ip_str);
     }
     return ESP_OK;
 }
+
 static esp_err_t log_handler(httpd_req_t *req)
 {
     ESP_LOGW("ESP32_ACTION", "Log Page Triggered");
     if (!is_logged_in(req)) {
+        char ip_str[48] = {0};
+        get_client_ip(req, ip_str, sizeof(ip_str));
+        get_timestamp_str(timestamp, sizeof(timestamp));
+        snprintf(log_buffer[current_log_idx], sizeof(log_buffer[current_log_idx]), "[%s] Unauthenticated user accessed log page from IP: %s", timestamp, ip_str);
+        snprintf(status_buffer[current_log_idx], sizeof(status_buffer[current_log_idx]), "%s", "<div style='color:red;'>Access denied. Please log in.</div>");
+        current_log_idx = (current_log_idx + 1) % 10;
         httpd_resp_set_status(req, "303 See Other");
         httpd_resp_set_hdr(req, "Location", "/login");
         httpd_resp_sendstr_chunk(req, NULL);
@@ -266,10 +400,6 @@ static esp_err_t log_handler(httpd_req_t *req)
     
     char ip_str[48] = {0};
     get_client_ip(req, ip_str, sizeof(ip_str));
-
-    snprintf(log_buffer[current_log_idx], sizeof(log_buffer[current_log_idx]), "Log page accessed by: %s", ip_str);
-    snprintf(status_buffer[current_log_idx], sizeof(status_buffer[current_log_idx]), "%s", "<div style='color:green;'>Log page accessed successfully.</div>");
-    current_log_idx = (current_log_idx + 1) % 10;
     
     httpd_resp_set_type(req, "text/html");
     httpd_resp_sendstr_chunk(req,  "<!DOCTYPE html><html><head><title>ESP32 Web Server</title></head>"
@@ -294,103 +424,7 @@ static esp_err_t log_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-static esp_err_t login_page(httpd_req_t *req)
-{
-    // Check if the user is already authenticated
-    char ip_str[48] = {0};
-    get_client_ip(req, ip_str, sizeof(ip_str));
-    
-    bool already_logged = false;
-    char cookie_buf[128] = {0};
-    size_t header_len = httpd_req_get_hdr_value_len(req, "Cookie");
 
-    if (header_len > 0 && header_len < sizeof(cookie_buf)) {
-        if (httpd_req_get_hdr_value_str(req, "Cookie", cookie_buf, sizeof(cookie_buf)) == ESP_OK) {
-            for (int i = 0; i < MAX_SESSIONS; i++) {
-                if (strlen(session_table[i].token) > 0 && 
-                    strcmp(session_table[i].ip, ip_str) == 0 && 
-                    strstr(cookie_buf, session_table[i].token) != NULL) {
-                    already_logged = true;
-                    break;
-                }
-            }
-        }
-    }
-
-    if (!already_logged) {
-        httpd_resp_set_type(req, "text/html");
-        httpd_resp_sendstr_chunk(req, "<!DOCTYPE html><html><head><title>Login</title></head>"
-                                    "<style>body{ background-color: #121212; color: #00ff66; text-align: center; }</style>"
-                                    "<body><h1>Login</h1><br>"
-                                    "<form method='POST' action='/login'>"
-                                    "<input type='text' name='username' placeholder='Username'><br><br>"
-                                    "<input type='password' name='password' placeholder='Password'><br><br>"
-                                    "<input type='submit' value='Login'>"
-                                    "</form></body></html>");
-        httpd_resp_sendstr_chunk(req, NULL);
-    } else {
-        httpd_resp_set_status(req, "303 See Other");
-        httpd_resp_set_hdr(req, "Location", "/");
-        httpd_resp_sendstr_chunk(req, NULL);
-    }
-    return ESP_OK;
-}
-
-static esp_err_t login_action_handler(httpd_req_t *req)
-{
-    char content[128] = {0};
-    size_t recv_size = req->content_len;
-
-    if (recv_size >= sizeof(content)) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Payload too large");
-        return ESP_FAIL;
-    }
-
-    int ret = httpd_req_recv(req, content, recv_size);
-    if (ret <= 0) return ESP_FAIL;
-    content[recv_size] = '\0'; 
-
-    char username[32] = {0};
-    char password[128] = {0};
-
-    if (httpd_query_key_value(content, "username", username, sizeof(username)) == ESP_OK &&
-        httpd_query_key_value(content, "password", password, sizeof(password)) == ESP_OK) {
-
-        if (strcmp(username, "admin") == 0 && strcmp(password, "admin") == 0) {
-            
-            char ip_str[48] = {0};
-            get_client_ip(req, ip_str, sizeof(ip_str)); // ◄ Added this crucial fix to populate client IP
-
-            char generated_token[17] = {0};
-            snprintf(generated_token, sizeof(generated_token), "%08lx%08lx", esp_random(), esp_random());
-
-            int slot_to_use = 0; 
-            for(int i = 0; i < MAX_SESSIONS; i++) {
-                if(strlen(session_table[i].token) == 0 || strcmp(session_table[i].ip, ip_str) == 0) {
-                    slot_to_use = i;
-                    break;
-                }
-            }
-            
-            strcpy(session_table[slot_to_use].ip, ip_str);
-            strcpy(session_table[slot_to_use].token, generated_token);
-
-            char cookie_header[128];
-            snprintf(cookie_header, sizeof(cookie_header), "session=%s; Path=/; HttpOnly; Secure", generated_token);
-
-            httpd_resp_set_status(req, "303 See Other");
-            httpd_resp_set_hdr(req, "Location", "/");
-            httpd_resp_set_hdr(req, "Set-Cookie", cookie_header);
-            httpd_resp_sendstr_chunk(req, NULL);
-            return ESP_OK;
-        }
-    }
-
-    httpd_resp_set_status(req, "303 See Other");
-    httpd_resp_set_hdr(req, "Location", "/login");
-    httpd_resp_sendstr_chunk(req, NULL);
-    return ESP_OK;
-}
 
 static void start_my_web_server(void)
 {
@@ -567,7 +601,8 @@ static void udp_server_task(void *pvParameters)
                         send_wakeup_magic_packet(target_addr, command, addr_str);
                     } else {
                         ESP_LOGW(TAG, "Missing target address parameter!");
-                        snprintf(log_buffer[current_log_idx], sizeof(log_buffer[current_log_idx]), "Command: %s, Missing Target Address From: %s", command, addr_str);
+                        get_timestamp_str(timestamp, sizeof(timestamp));
+                        snprintf(log_buffer[current_log_idx], sizeof(log_buffer[current_log_idx]), "[%s] Command: %s, Missing Target Address From: %s", timestamp, command, addr_str);
                         snprintf(status_buffer[current_log_idx], sizeof(status_buffer[current_log_idx]), "%s", "<div style='color:red;'>Error: Missing target address.</div>");
                         current_log_idx = (current_log_idx + 1) % 10;
                     }
@@ -595,8 +630,9 @@ void app_main(void)
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-
     ESP_ERROR_CHECK(example_connect());
+
+    init_sntp_time();
     start_my_web_server();
 
 #ifdef CONFIG_EXAMPLE_IPV4
