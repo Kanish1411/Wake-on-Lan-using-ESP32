@@ -7,6 +7,7 @@
    CONDITIONS OF ANY KIND, either express or implied.
 */
 #include <string.h>
+#include <ctype.h>
 #include <sys/param.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -17,8 +18,7 @@
 #include "nvs_flash.h"
 #include "esp_netif.h"
 #include "protocol_examples_common.h"
-#include "esp_http_server.h"
-#include "esp_log.h"
+#include "esp_https_server.h"
 
 #include "lwip/err.h"
 #include "lwip/sockets.h"
@@ -32,15 +32,85 @@ static char status_buffer[10][256] = {
     "No commands received yet."
 };
 
-
 static int current_log_idx = 1;
 
 #define PORT CONFIG_EXAMPLE_PORT
 
 static const char *TAG = "ESP_UDP_SERVER";
+#define MAX_SESSIONS 4
+#define SESSION_TOKEN_LEN 16
+
+typedef struct {
+    char ip[48];
+    char token[SESSION_TOKEN_LEN + 1];
+    int64_t expiry_time; 
+} client_session_t;
+
+static client_session_t session_table[MAX_SESSIONS];
+
+extern const unsigned char servercert_start[] asm("_binary_servercert_pem_start");
+extern const unsigned char servercert_end[]   asm("_binary_servercert_pem_end");
+extern const unsigned char prkey_start[] asm("_binary_prkey_pem_start");
+extern const unsigned char prkey_end[]   asm("_binary_prkey_pem_end");
+
+
+static void url_decode(char *dst, const char *src) {
+    char a, b;
+    while (*src) {
+        if ((*src == '%') &&
+            ((a = src[1]) && (b = src[2])) &&
+            (isxdigit((int)a) && isxdigit((int)b))) {
+            if (a >= 'a') a -= 'a' - 10;
+            else if (a >= 'A') a -= 'A' - 10;
+            else a -= '0';
+            
+            if (b >= 'a') b -= 'a' - 10;
+            else if (b >= 'A') b -= 'A' - 10;
+            else b -= '0';
+            
+            *dst++ = 16 * a + b;
+            src += 3;
+        } else if (*src == '+') {
+            *dst++ = ' ';
+            src++;
+        } else {
+            *dst++ = *src++;
+        }
+    }
+    *dst = '\0';
+}
+
+// Helper function to extract IP from an active HTTP request
+static void get_client_ip(httpd_req_t *req, char *ip_str, size_t max_len) {
+    strncpy(ip_str, "Unknown", max_len);
+    int sockfd = httpd_req_to_sockfd(req);        
+    if (sockfd >= 0) {
+        struct sockaddr_storage addr;
+        socklen_t len = sizeof(addr);
+        if (getpeername(sockfd, (struct sockaddr *)&addr, &len) == 0) {
+            if (addr.ss_family == AF_INET) {
+                struct sockaddr_in *s = (struct sockaddr_in *)&addr;
+                inet_ntoa_r(s->sin_addr, ip_str, max_len);
+            } else if (addr.ss_family == AF_INET6) {
+                struct sockaddr_in6 *s = (struct sockaddr_in6 *)&addr;
+                if (IN6_IS_ADDR_V4MAPPED(&s->sin6_addr)) {
+                    uint8_t *ipv4 = (uint8_t *)&s->sin6_addr.s6_addr[12];
+                    snprintf(ip_str, max_len, "%d.%d.%d.%d", ipv4[0], ipv4[1], ipv4[2], ipv4[3]);
+                } else {
+                    inet6_ntoa_r(s->sin6_addr, ip_str, max_len);
+                }
+            }
+        }
+    }
+}
+
 static void send_wakeup_magic_packet(const char *mac_str, const char *command, const char *addr_str) {
     uint8_t target_mac[6];
-    snprintf(log_buffer[current_log_idx], sizeof(log_buffer[current_log_idx]), "Command: %s, Target: %s From: %s", command, mac_str, addr_str);
+    char mac_unreadable[18];
+    char mask_mac[18];
+    snprintf(mask_mac, sizeof(mask_mac), "%s", mac_str);
+    snprintf(mac_unreadable, sizeof(mac_unreadable), "%.5s:xx:xx:xx:xx", mask_mac);
+    snprintf(log_buffer[current_log_idx], sizeof(log_buffer[current_log_idx]), "Command: %s, Target: %s From: %s", command, mac_unreadable, addr_str);
 
     int parsed_fields = sscanf(mac_str, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", 
                                &target_mac[0], &target_mac[1], &target_mac[2], 
@@ -53,18 +123,12 @@ static void send_wakeup_magic_packet(const char *mac_str, const char *command, c
         return;
     }
 
-    // --- CONSTRUCT THE MAGIC PACKET ---
     uint8_t magic_packet[102];
-    
-    // The first 6 bytes must be completely filled with 0xFF
     memset(magic_packet, 0xFF, 6);
-    
-    // The next 96 bytes contain the physical target MAC address repeated exactly 16 times
     for (int i = 1; i <= 16; i++) {
         memcpy(&magic_packet[i * 6], target_mac, 6);
     }
 
-    // --- BLAST OUT THE UDP BROADCAST ---
     int broadcast_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
     if (broadcast_sock < 0) {
         ESP_LOGE(TAG, "Failed to instantiate broadcast socket");
@@ -73,17 +137,14 @@ static void send_wakeup_magic_packet(const char *mac_str, const char *command, c
         return;
     }
 
-    // Essential socket option: Tell the OS kernel we are intentionally sending a broadcast frame
     int broadcast_permission = 1;
     setsockopt(broadcast_sock, SOL_SOCKET, SO_BROADCAST, &broadcast_permission, sizeof(broadcast_permission));
 
-    // Target the absolute local network broadcast layer address
     struct sockaddr_in broadcast_addr;
     broadcast_addr.sin_addr.s_addr = inet_addr("255.255.255.255");
     broadcast_addr.sin_family = AF_INET;
-    broadcast_addr.sin_port = htons(9); // Port 9 is the industry standard baseline for WoL listener agents
+    broadcast_addr.sin_port = htons(9); 
 
-    // Blast the payload onto the network wire
     sendto(broadcast_sock, magic_packet, sizeof(magic_packet), 0, 
            (struct sockaddr *)&broadcast_addr, sizeof(broadcast_addr));
 
@@ -94,63 +155,302 @@ static void send_wakeup_magic_packet(const char *mac_str, const char *command, c
     close(broadcast_sock);
 }
 
+static bool is_logged_in(httpd_req_t *req) {
+    char ip_str[48] = {0};
+    get_client_ip(req, ip_str, sizeof(ip_str));
 
-static esp_err_t homepage_action_handler(httpd_req_t *req)
-{
-    ESP_LOGW("ESP32_ACTION", "Web Server Triggered");
-    httpd_resp_set_type(req, "text/html");
+    // Extract and check the Cookie header string
+    char cookie_buf[128] = {0};
+    size_t header_len = httpd_req_get_hdr_value_len(req, "Cookie");
 
-    // 1. Send the HTML header chunk
-    const char *html_head = "<!DOCTYPE html><html><head><title>ESP32 Web Server</title></head>"
-                            "<style>body{ background-color: #121212; color: #00ff66; text-align: center; }</style>"
-                            "<body><h1>ESP32 Logs</h1><br>"
-                            "<div style='background:#1a1a1e; color:#00ff66; padding:20px; border-radius:6px; "
-                            "border:1px solid #29292e; font-family:monospace; text-align:left; "
-                            "display:inline-block; width:80%%; max-width:600px; max-height:400px; overflow-y:auto; "
-                            "white-space:pre-wrap; line-height:1.6; text-align: center;'>";
-    httpd_resp_sendstr_chunk(req, html_head);
-
-    // 2. Loop through and stream your logs directly line-by-line
-    for(int i = 0; i < 10; i++) {
-        // Only print if the log row actually contains written data
-        if (strlen(log_buffer[i]) > 0) {
-            char row_buf[261];
-            char status_buf[261];
-            // Format line cleanly with an HTML line break
-            snprintf(row_buf, sizeof(row_buf), "%s", log_buffer[i]);
-            snprintf(status_buf, sizeof(status_buf), "%s<br>", status_buffer[i]);
-            // Push this line out directly to the network buffer
-            httpd_resp_sendstr_chunk(req, row_buf);
-            httpd_resp_sendstr_chunk(req, status_buf);
+    if (header_len > 0 && header_len < sizeof(cookie_buf)) {
+        if (httpd_req_get_hdr_value_str(req, "Cookie", cookie_buf, sizeof(cookie_buf)) == ESP_OK) {
+            // Find an active session in our table matching this client's IP and cookie token
+            for (int i = 0; i < MAX_SESSIONS; i++) {
+                if (strlen(session_table[i].token) > 0 && 
+                    strcmp(session_table[i].ip, ip_str) == 0 && 
+                    strstr(cookie_buf, session_table[i].token) != NULL) {
+                    return true; 
+                }
+            }
         }
     }
 
-    // 3. Send the HTML footer closing tags
-    const char *html_foot = "</div></body></html>";
-    httpd_resp_sendstr_chunk(req, html_foot);
+    // Fallback: Log unauthorized attempts dynamically
+    snprintf(log_buffer[current_log_idx], sizeof(log_buffer[current_log_idx]), "Unauthorized access attempt from: %s", ip_str);
+    snprintf(status_buffer[current_log_idx], sizeof(status_buffer[current_log_idx]), "%s", "<div style='color:red;'>Unauthorized access. Please log in.</div>");
+    current_log_idx = (current_log_idx + 1) % 10;
+    return false;
+}
 
-    // 4. Send an empty chunk to explicitly tell the browser we are done transmission
+static esp_err_t homepage_action_handler(httpd_req_t *req){
+    if (!is_logged_in(req)) {
+        httpd_resp_set_status(req, "303 See Other");
+        httpd_resp_set_hdr(req, "Location", "/login");
+        httpd_resp_sendstr_chunk(req, NULL);
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_sendstr_chunk(req,  "<!DOCTYPE html><html><head><title>ESP32 Web Server</title></head>"
+                                "<style>body{ background-color: #121212; color: #00ff66; text-align: center; }</style>"
+                                "<body><h1>ESP32 Control Portal</h1><br>"
+                                "<div style='background:#1a1a1e; color:#00ff66; padding:20px; border-radius:6px; "
+                                "border:1px solid #29292e; font-family:monospace; text-align:left; display:inline-block;'> "
+                                "<button onclick=\"location.href='/logs'\">View Logs</button><br><br>"
+                                "<button onclick=\"location.href='/wol'\">Send WoL Packet</button></div></body></html>");
+    httpd_resp_sendstr_chunk(req, NULL);
+    return ESP_OK;
+}
+static esp_err_t wol_handler(httpd_req_t *req){
+    if (!is_logged_in(req)) {
+        httpd_resp_set_status(req, "303 See Other");
+        httpd_resp_set_hdr(req, "Location", "/login");
+        httpd_resp_sendstr_chunk(req, NULL);
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_sendstr_chunk(req, "<!DOCTYPE html><html><head><title>ESP32 Web Server</title></head>"
+                                "<style>body{ background-color: #121212; color: #00ff66; text-align: center; }</style>"
+                                "<body><h1>Send Wake-on-LAN Packet</h1><br>"
+                                "<form method='POST' action='/wol'>"
+                                "<input type='text' name='mac' placeholder='Target MAC Address (e.g. AA:BB:CC:DD:EE:FF)'><br><br>"
+                                "<input type='submit' value='Send WoL Packet'>"
+                                "</form> <button onclick=\"location.href='/'\">Back to Home</button>"
+                                "</body></html>");
+    httpd_resp_sendstr_chunk(req, NULL);    
+    return ESP_OK;
+}
+
+static esp_err_t wol_action_handler(httpd_req_t *req){
+    if (!is_logged_in(req)) {
+        httpd_resp_set_status(req, "303 See Other");
+        httpd_resp_set_hdr(req, "Location", "/login");
+        httpd_resp_sendstr_chunk(req, NULL);
+        return ESP_OK;
+    }
+    char content[128] = {0};
+    size_t recv_size = req->content_len;
+
+    if (recv_size >= sizeof(content)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Payload too large");
+        return ESP_FAIL;
+    }
+
+    int ret = httpd_req_recv(req, content, recv_size);
+    if (ret <= 0) return ESP_FAIL;
+    content[recv_size] = '\0'; 
+
+    char mac[32] = {0};
+
+    if (httpd_query_key_value(content, "mac", mac, sizeof(mac)) == ESP_OK) {
+        char ip_str[48] = {0};
+        char decoded_mac[32] = {0};
+        url_decode(decoded_mac, mac);
+        get_client_ip(req, ip_str, sizeof(ip_str));
+        snprintf(log_buffer[current_log_idx], sizeof(log_buffer[current_log_idx]), "WoL command received for MAC: %s from IP: %s", decoded_mac, ip_str);
+        snprintf(status_buffer[current_log_idx], sizeof(status_buffer[current_log_idx]), "%s", "<div style='color:green;'>WoL command received. Attempting to send magic packet...</div>");
+        current_log_idx = (current_log_idx + 1) % 10;
+        send_wakeup_magic_packet(decoded_mac, "Manual WoL Trigger", ip_str);
+    }
+    return ESP_OK;
+}
+static esp_err_t log_handler(httpd_req_t *req)
+{
+    ESP_LOGW("ESP32_ACTION", "Log Page Triggered");
+    if (!is_logged_in(req)) {
+        httpd_resp_set_status(req, "303 See Other");
+        httpd_resp_set_hdr(req, "Location", "/login");
+        httpd_resp_sendstr_chunk(req, NULL);
+        return ESP_OK;
+    }
+    
+    char ip_str[48] = {0};
+    get_client_ip(req, ip_str, sizeof(ip_str));
+
+    snprintf(log_buffer[current_log_idx], sizeof(log_buffer[current_log_idx]), "Log page accessed by: %s", ip_str);
+    snprintf(status_buffer[current_log_idx], sizeof(status_buffer[current_log_idx]), "%s", "<div style='color:green;'>Log page accessed successfully.</div>");
+    current_log_idx = (current_log_idx + 1) % 10;
+    
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_sendstr_chunk(req,  "<!DOCTYPE html><html><head><title>ESP32 Web Server</title></head>"
+                                "<style>body{ background-color: #121212; color: #00ff66; text-align: center; }</style>"
+                                "<body><h1>ESP32 Logs</h1><br>"
+                                "<div style='background:#1a1a1e; color:#00ff66; padding:20px; border-radius:6px; "
+                                "border:1px solid #29292e; font-family:monospace; text-align:left; "
+                                "display:inline-block; width:80%%; max-width:600px; max-height:400px; overflow-y:auto; "
+                                "white-space:pre-wrap; line-height:1.6;'>");
+
+    for(int i = 0; i < 10; i++) {
+        if (strlen(log_buffer[i]) > 0) {
+            httpd_resp_sendstr_chunk(req, log_buffer[i]);
+            httpd_resp_sendstr_chunk(req, status_buffer[i]);
+            httpd_resp_sendstr_chunk(req, "<br>");
+        }
+    }
+
+    httpd_resp_sendstr_chunk(req, "</div><br><br><button onclick=\"location.href='/'\">Back to Home</button></body></html>");
     httpd_resp_sendstr_chunk(req, NULL);
 
     return ESP_OK;
 }
 
-static const httpd_uri_t homepage_uri = {
-    .uri       = "/",
-    .method    = HTTP_GET,
-    .handler   = homepage_action_handler,
-    .user_ctx  = NULL
-};
+static esp_err_t login_page(httpd_req_t *req)
+{
+    // Check if the user is already authenticated
+    char ip_str[48] = {0};
+    get_client_ip(req, ip_str, sizeof(ip_str));
+    
+    bool already_logged = false;
+    char cookie_buf[128] = {0};
+    size_t header_len = httpd_req_get_hdr_value_len(req, "Cookie");
+
+    if (header_len > 0 && header_len < sizeof(cookie_buf)) {
+        if (httpd_req_get_hdr_value_str(req, "Cookie", cookie_buf, sizeof(cookie_buf)) == ESP_OK) {
+            for (int i = 0; i < MAX_SESSIONS; i++) {
+                if (strlen(session_table[i].token) > 0 && 
+                    strcmp(session_table[i].ip, ip_str) == 0 && 
+                    strstr(cookie_buf, session_table[i].token) != NULL) {
+                    already_logged = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!already_logged) {
+        httpd_resp_set_type(req, "text/html");
+        httpd_resp_sendstr_chunk(req, "<!DOCTYPE html><html><head><title>Login</title></head>"
+                                    "<style>body{ background-color: #121212; color: #00ff66; text-align: center; }</style>"
+                                    "<body><h1>Login</h1><br>"
+                                    "<form method='POST' action='/login'>"
+                                    "<input type='text' name='username' placeholder='Username'><br><br>"
+                                    "<input type='password' name='password' placeholder='Password'><br><br>"
+                                    "<input type='submit' value='Login'>"
+                                    "</form></body></html>");
+        httpd_resp_sendstr_chunk(req, NULL);
+    } else {
+        httpd_resp_set_status(req, "303 See Other");
+        httpd_resp_set_hdr(req, "Location", "/");
+        httpd_resp_sendstr_chunk(req, NULL);
+    }
+    return ESP_OK;
+}
+
+static esp_err_t login_action_handler(httpd_req_t *req)
+{
+    char content[128] = {0};
+    size_t recv_size = req->content_len;
+
+    if (recv_size >= sizeof(content)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Payload too large");
+        return ESP_FAIL;
+    }
+
+    int ret = httpd_req_recv(req, content, recv_size);
+    if (ret <= 0) return ESP_FAIL;
+    content[recv_size] = '\0'; 
+
+    char username[32] = {0};
+    char password[128] = {0};
+
+    if (httpd_query_key_value(content, "username", username, sizeof(username)) == ESP_OK &&
+        httpd_query_key_value(content, "password", password, sizeof(password)) == ESP_OK) {
+
+        if (strcmp(username, "admin") == 0 && strcmp(password, "admin") == 0) {
+            
+            char ip_str[48] = {0};
+            get_client_ip(req, ip_str, sizeof(ip_str)); // ◄ Added this crucial fix to populate client IP
+
+            char generated_token[17] = {0};
+            snprintf(generated_token, sizeof(generated_token), "%08lx%08lx", esp_random(), esp_random());
+
+            int slot_to_use = 0; 
+            for(int i = 0; i < MAX_SESSIONS; i++) {
+                if(strlen(session_table[i].token) == 0 || strcmp(session_table[i].ip, ip_str) == 0) {
+                    slot_to_use = i;
+                    break;
+                }
+            }
+            
+            strcpy(session_table[slot_to_use].ip, ip_str);
+            strcpy(session_table[slot_to_use].token, generated_token);
+
+            char cookie_header[128];
+            snprintf(cookie_header, sizeof(cookie_header), "session=%s; Path=/; HttpOnly; Secure", generated_token);
+
+            httpd_resp_set_status(req, "303 See Other");
+            httpd_resp_set_hdr(req, "Location", "/");
+            httpd_resp_set_hdr(req, "Set-Cookie", cookie_header);
+            httpd_resp_sendstr_chunk(req, NULL);
+            return ESP_OK;
+        }
+    }
+
+    httpd_resp_set_status(req, "303 See Other");
+    httpd_resp_set_hdr(req, "Location", "/login");
+    httpd_resp_sendstr_chunk(req, NULL);
+    return ESP_OK;
+}
 
 static void start_my_web_server(void)
 {
     httpd_handle_t my_server = NULL;
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG(); // This fires up TCP Port 80
+    httpd_ssl_config_t config = HTTPD_SSL_CONFIG_DEFAULT();
+    config.servercert = servercert_start;
+    config.servercert_len = servercert_end - servercert_start;
+    config.prvtkey_pem = prkey_start;
+    config.prvtkey_len = prkey_end - prkey_start;
 
-    if (httpd_start(&my_server, &config) == ESP_OK) {
-        // Register your clean single-page layout
-        httpd_register_uri_handler(my_server, &homepage_uri);
-        ESP_LOGI("WEB_SERVER", "Web server successfully launched on port 80!");
+    ESP_LOGI(TAG, "Launching secure engine on port 443...");
+    if (httpd_ssl_start(&my_server, &config) == ESP_OK) {
+        
+        httpd_uri_t uri_home = {
+            .uri      = "/",
+            .method   = HTTP_GET,
+            .handler  = homepage_action_handler, 
+            .user_ctx = NULL
+        };
+        httpd_uri_t uri_login = {
+            .uri      = "/login",
+            .method   = HTTP_GET,
+            .handler  = login_page, 
+            .user_ctx = NULL
+        };
+
+        httpd_uri_t uri_login_post = {
+            .uri      = "/login",
+            .method   = HTTP_POST,
+            .handler  = login_action_handler,
+            .user_ctx = NULL
+        };
+        httpd_uri_t uri_logs = {
+            .uri      = "/logs",
+            .method   = HTTP_GET,
+            .handler  = log_handler, 
+            .user_ctx = NULL
+        };
+        httpd_uri_t uri_wol = {
+            .uri      = "/wol",
+            .method   = HTTP_GET,
+            .handler  = wol_handler, 
+            .user_ctx = NULL
+        };
+        httpd_uri_t uri_wol_action = {
+            .uri      = "/wol",
+            .method   = HTTP_POST,
+            .handler  = wol_action_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(my_server, &uri_home);
+        httpd_register_uri_handler(my_server, &uri_login);
+        httpd_register_uri_handler(my_server, &uri_login_post);
+        httpd_register_uri_handler(my_server, &uri_logs);
+        httpd_register_uri_handler(my_server, &uri_wol);
+        httpd_register_uri_handler(my_server, &uri_wol_action);
+
+        ESP_LOGI(TAG, "HTTPS Web Server successfully deployed!");
+    } else {
+        ESP_LOGE(TAG, "Critical: HTTPS engine initialization failed!");
     }
 }
 
@@ -191,14 +491,11 @@ static void udp_server_task(void *pvParameters)
 
 #if defined(CONFIG_EXAMPLE_IPV4) && defined(CONFIG_EXAMPLE_IPV6)
         if (addr_family == AF_INET6) {
-            // Note that by default IPV6 binds to both protocols, it is must be disabled
-            // if both protocols used at the same time (used in CI)
             int opt = 1;
             setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
             setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, &opt, sizeof(opt));
         }
 #endif
-        // Set timeout
         struct timeval timeout;
         timeout.tv_sec = 10;
         timeout.tv_usec = 0;
@@ -210,7 +507,7 @@ static void udp_server_task(void *pvParameters)
         }
         ESP_LOGI(TAG, "Socket bound, port %d", PORT);
 
-        struct sockaddr_storage source_addr; // Large enough for both IPv4 or IPv6
+        struct sockaddr_storage source_addr; 
         socklen_t socklen = sizeof(source_addr);
 
 #if defined(CONFIG_LWIP_NETBUF_RECVINFO) && !defined(CONFIG_EXAMPLE_IPV6)
@@ -237,14 +534,11 @@ static void udp_server_task(void *pvParameters)
 #else
             int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer) - 1, 0, (struct sockaddr *)&source_addr, &socklen);
 #endif
-            // Error occurred during receiving
             if (len < 0) {
                 ESP_LOGE(TAG, "recvfrom failed: errno %d", errno);
                 break;
             }
-            // Data received
             else {
-                // Get the sender's ip address as string
                 if (source_addr.ss_family == PF_INET) {
                     inet_ntoa_r(((struct sockaddr_in *)&source_addr)->sin_addr, addr_str, sizeof(addr_str) - 1);
 #if defined(CONFIG_LWIP_NETBUF_RECVINFO) && !defined(CONFIG_EXAMPLE_IPV6)
@@ -260,24 +554,17 @@ static void udp_server_task(void *pvParameters)
                     inet6_ntoa_r(((struct sockaddr_in6 *)&source_addr)->sin6_addr, addr_str, sizeof(addr_str) - 1);
                 }
 
-                rx_buffer[len] = 0; // Null-terminate whatever we received and treat like a string...
+                rx_buffer[len] = 0; 
                 char *command = strtok(rx_buffer, " ");
 
-                // 2. Validate that the command is actually "connect"
                 if (command != NULL && strncmp(command, "ping", 4) == 0) {
-                    
-                    // 3. Extract the second token (The Target Address)
-                    // Passing NULL tells strtok to continue scanning the same buffer from where it left off
                     char *target_addr = strtok(NULL, " ");
-                    
                     if (target_addr != NULL) {
                         ESP_LOGI(TAG, "Command: %s", command);
                         ESP_LOGI(TAG, "Target Address Extracted: %s", target_addr);
                         ESP_LOGI(TAG, "Address Extracted: %s", addr_str);
                         
                         send_wakeup_magic_packet(target_addr, command, addr_str);
-                        
-                        
                     } else {
                         ESP_LOGW(TAG, "Missing target address parameter!");
                         snprintf(log_buffer[current_log_idx], sizeof(log_buffer[current_log_idx]), "Command: %s, Missing Target Address From: %s", command, addr_str);
@@ -309,10 +596,6 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    /* This helper function configures Wi-Fi or Ethernet, as selected in menuconfig.
-     * Read "Establishing Wi-Fi or Ethernet Connection" section in
-     * examples/protocols/README.md for more information about this function.
-     */
     ESP_ERROR_CHECK(example_connect());
     start_my_web_server();
 
@@ -322,5 +605,4 @@ void app_main(void)
 #ifdef CONFIG_EXAMPLE_IPV6
     xTaskCreate(udp_server_task, "udp_server", 4096, (void*)AF_INET6, 5, NULL);
 #endif
-
 }
