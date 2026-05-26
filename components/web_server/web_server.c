@@ -254,6 +254,9 @@ static esp_err_t wol_action_handler(httpd_req_t *req){
 
     if (recv_size >= sizeof(content)) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Payload too large");
+        httpd_resp_set_status(req, "303 See Other");
+        httpd_resp_set_hdr(req, "Location", "/logs"); 
+        httpd_resp_sendstr_chunk(req, NULL);
         return ESP_FAIL;
     }
 
@@ -273,6 +276,7 @@ static esp_err_t wol_action_handler(httpd_req_t *req){
                 "WoL command received for MAC: %.5s:xx:xx:xx:xx from IP: %s",  decoded_mac, ip_str);
         write_log(formatted_message, "<div style='color:green;'>WoL command received. Attempting to send magic packet...</div>");
         send_wakeup_magic_packet(decoded_mac, "Manual WoL Trigger", ip_str);
+        
     }
     httpd_resp_set_status(req, "303 See Other");
     httpd_resp_set_hdr(req, "Location", "/logs"); 

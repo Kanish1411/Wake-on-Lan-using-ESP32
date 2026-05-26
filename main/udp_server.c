@@ -4,9 +4,9 @@
 #include "esp_event.h"
 #include "protocol_examples_common.h"
 
-// Component Modules
 #include <logger.h>
 #include <web_server.h>
+// #include <ping.h>
 
 void app_main(void)
 {
@@ -18,6 +18,6 @@ void app_main(void)
 
     init_sntp_time();
     write_log("System initialized.", "Awaiting incoming web panel connections.");
-
+    // ping_device_is_online("192.168.1.1", 1000);
     start_my_web_server();
 }
