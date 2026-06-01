@@ -19,10 +19,13 @@
 #include <logger.h>              
 #include "web_server.h"
 #include <controls.h>
+#include <demographic.h>
+#include <firewall.h>
 
 #define MAX_SESSIONS 4
 #define SESSION_TOKEN_LEN 16
 static const char *TAG = "WEB_SERVER";
+extern char log_message[64];
 
 typedef struct {
     char ip[48];
@@ -97,9 +100,11 @@ static bool is_logged_in(httpd_req_t *req, const char *location) {
     static char timestamp[32];
     get_timestamp_str(timestamp, sizeof(timestamp));
     char formatted_message[256];
+    get_log_message(ip_str);
     snprintf(formatted_message, sizeof(formatted_message), 
-             "Unauthenticated access attempt to %s from IP: %s", 
-             location, ip_str);
+             "Unauthenticated access attempt to %s from IP: %s Demographics: %s", 
+             location, ip_str, log_message);
+
     write_log(formatted_message, "<div style='color:red;'>Access denied. Please log in.</div>");
     return false;
 }
@@ -137,6 +142,7 @@ static esp_err_t login_page(httpd_req_t *req)
                                     "</form></body></html>");
         httpd_resp_sendstr_chunk(req, NULL);
     } else {
+        
         httpd_resp_set_status(req, "303 See Other");
         httpd_resp_set_hdr(req, "Location", "/");
         httpd_resp_sendstr_chunk(req, NULL);
@@ -160,10 +166,10 @@ static esp_err_t login_action_handler(httpd_req_t *req)
 
     char username[32] = {0};
     char password[128] = {0};
-
-    if (httpd_query_key_value(content, "username", username, sizeof(username)) == ESP_OK &&
+    char ip_str[48] = {0};
+    get_client_ip(req, ip_str, sizeof(ip_str));
+    if (is_allowed(req, ip_str) && httpd_query_key_value(content, "username", username, sizeof(username)) == ESP_OK &&
         httpd_query_key_value(content, "password", password, sizeof(password)) == ESP_OK) {
-
         if (strcmp(username, "admin") == 0 && strcmp(password, "admin") == 0) {
             
             char ip_str[48] = {0};
@@ -186,7 +192,14 @@ static esp_err_t login_action_handler(httpd_req_t *req)
 
             char cookie_header[128];
             snprintf(cookie_header, sizeof(cookie_header), "session=%s; Path=/; HttpOnly; Secure", generated_token);
-
+            static char timestamp[32];
+            get_timestamp_str(timestamp, sizeof(timestamp));
+            char formatted_message[256];
+            get_log_message(ip_str);
+            snprintf(formatted_message, sizeof(formatted_message), 
+                    "Logged in from IP: %s Demographics: %s", 
+                        ip_str, log_message);
+            write_log(formatted_message, "<div style='color:green;'>Access granted.</div>");
             httpd_resp_set_status(req, "303 See Other");
             httpd_resp_set_hdr(req, "Location", "/");
             httpd_resp_set_hdr(req, "Set-Cookie", cookie_header);
@@ -372,13 +385,20 @@ void start_my_web_server(void)
             .handler  = wol_action_handler,
             .user_ctx = NULL
         };
+        httpd_uri_t uri_not_found = {
+            .uri      = "/*",
+            .method   = HTTP_GET,
+            .handler  = login_page, 
+            .user_ctx = NULL
+        };
         httpd_register_uri_handler(my_server, &uri_home);
         httpd_register_uri_handler(my_server, &uri_login);
         httpd_register_uri_handler(my_server, &uri_login_post);
         httpd_register_uri_handler(my_server, &uri_logs);
         httpd_register_uri_handler(my_server, &uri_wol);
         httpd_register_uri_handler(my_server, &uri_wol_action);
-
+        httpd_register_uri_handler(my_server, &uri_not_found);
+        
         ESP_LOGI(TAG, "HTTPS Web Server successfully deployed!");
     } else {
         ESP_LOGE(TAG, "Critical: HTTPS engine initialization failed!");
